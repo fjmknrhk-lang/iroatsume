@@ -1,0 +1,1583 @@
+;いろあつめ  HSP3Dish版(Web・iPhone縦画面向け)
+;original: FUJIMAKI Norihiko  2011.4.28 開発開始 / 2011.6.12 V1
+;
+;移植メモ
+; ・#pack を廃止し、画像はPNG(黒背景を透過)に変更
+; ・盤面データ(4x4～10x10.txt)はソースに文字列として埋め込み
+; ・操作をタッチ式に変更(タイルをタッチして、そのままスワイプでスライド)
+; ・メニューはタップで選ぶ。キーボード操作も残してあるのでPCでも確認できる
+; ・描画は 280x340 を基準にして、ウィンドウに合わせて拡大
+; ・★印は、Web/iOS上での動作確認が必要な箇所
+
+#define SCRW 280
+#define SCRH 340
+#define GM_T 2					;★透明付きコピーのモード(うまく透過しなければ3等に変更)
+#define FNT "ＭＳ ゴシック"		;★Web/iOSでは別のフォントに置き換わる可能性あり
+#define MY_BOLD 1
+#define BTN_X 4					;プレイ中メニューボタンの位置とサイズ
+#define BTN_Y 302
+#define BTN_W 108
+#define BTN_H 34
+#define ctype SX(%1) (ox+int((%1)*sc+0.5))
+#define ctype SY(%1) (oy+int((%1)*sc+0.5))
+
+sc=1.0: ox=0: oy=0
+tmx=0: tmy=0: tdn=0: tprev=0: tpress=0: trel=0
+drag=0: gdrag=0
+menu_pick=-1: menu_out=0
+
+;//// 拡大対応の描画ヘルパー(座標はすべて280x340基準) ////
+
+#deffunc gcls
+	color 0,0,0
+	boxf 0,0,ginfo_winx,ginfo_winy
+	return
+
+;塗りつぶし(右下の座標を含む)
+#deffunc gbox int ax,int ay,int bx,int by
+	boxf SX(ax),SY(ay),SX(bx+1)-1,SY(by+1)-1
+	return
+
+;縦線・横線(太さ1px分)
+#deffunc gline int ax,int ay,int bx,int by
+	g_x0=ax: g_x1=bx
+	if g_x0>g_x1:g_x0=bx:g_x1=ax
+	g_y0=ay: g_y1=by
+	if g_y0>g_y1:g_y0=by:g_y1=ay
+	boxf SX(g_x0),SY(g_y0),SX(g_x1+1)-1,SY(g_y1+1)-1
+	return
+
+;画像コピー(バッファab の(asx,asy,aw,ah)を(ax,ay)へ拡大コピー)
+#deffunc gput int ab,int asx,int asy,int aw,int ah,int ax,int ay
+	pos SX(ax),SY(ay)
+	gmode GM_T
+	gzoom SX(ax+aw)-SX(ax),SY(ay+ah)-SY(ay),ab,asx,asy,aw,ah,0
+	return
+
+#deffunc gtxt int ax,int ay,str s
+	pos SX(ax),SY(ay)
+	mes s
+	return
+
+#deffunc gfont int asz,int ast
+	font FNT,int(asz*sc+0.5),ast
+	return
+
+;ボタン描画
+#deffunc gbutton int ax,int ay,int aw,int ah,str bs
+	color 255,255,255
+	gbox ax,ay,ax+aw-1,ay+ah-1
+	color 64,64,64
+	gbox ax+1,ay+1,ax+aw-2,ay+ah-2
+	gfont 14,0
+	color 255,255,255
+	gtxt ax+8,ay+(ah-14)/2,bs
+	return
+
+;タッチ位置が範囲内なら1
+#defcfunc inrect int ax,int ay,int aw,int ah
+	if (tmx>=ax) and (tmx<ax+aw) and (tmy>=ay) and (tmy<ay+ah) :return 1
+	return 0
+
+;//// 盤面データ(各サイズ4パターン、行を連結したもの) ////
+bd4="TTTTT--TT--TTTTTTTT-TT-TT-TT-TTT-TT-TTTTTTTT-TT-TTTT-TT--TT-TTTT"
+bd6="TT--TTT-TT-T-TTTT--TTTT-T-TT-TTT--TT--TT---TTTT-TTTTTTTTTTTT-TTTT---TT--TTTTTTT----TT-TT-TT-TT-TT----TTTTTTTTTT-TTTTT-TT----TTTT----TT-TTTTT-TTT"
+bd8="--TTTT---TTTTTT-TTTTTTTTTTT--TTTTTT--TTTTTTTTTTT-TTTTTT---TTTT--TTTTTTTTT------TT-TTTT-TT-TTTT-TT-TTTT-TT-TTTT-TT------TTTTTTTTTTTT--TTTTTT--TTTTT-TT-TT--TTTT----TTTT--TT-TT-TTTTT--TTTTTT--TTT-TTT-TT-TTTT-TTTTTTT-TTT-----TTTTTT-----TTT-TTTTTTT-TTTT-TT-TTT-"
+bd10="TTT-TT-TTTT-T-TT-T-TTTT-TT-TTT----TT----TTTTTTTTTTTTTTTTTTTT----TT----TTT-TT-TTTT-T-TT-T-TTTT-TT-TTT--TTTTTT----TTTTTT--TTTTTTTTTTTTT----TTTTTT----TTTTTT----TTTTTT----TTTTTTTTTTTTT--TTTTTT----TTTTTT--TTTTTTT-TTTTTTTTT-TT--------TTTT-TTTT-TTTT-T--T-TTTT-T--T-TTTT-TTTT-TTTT--------TT-TTTTTTTTT-TTTTTTT-----------TTTTTTTT--TTTTTTTT--TTTTTTTT--TTTTTTTT--TTTTTTTT--TTTTTTTT--TTTTTTTT--TTTTTTTT-----------"
+
+;//// 画像の読み込み ////
+;★celload で読み込んだバッファを gzoom の転送元に使えるか確認
+celload "tile04.png",1
+celload "hands.png",2
+celload "title4.png",3
+
+;//// 効果音の読み込み ////
+;Thanks to
+;TAM MUSIC Factory     http://www.tam-music.com/index.html
+;Free音素材「音楽室」  http://www.otosozai.com/
+;魔王魂                http://maoudamashii.jokersounds.com/
+;★音声ファイルは .hsp と同じ場所に置く。Webでwav/mp3が鳴らなければ ogg に変換
+
+mmload "se_saa04.wav",0	;スライド
+mmload "cursor5.wav",1	;スライドできない
+mmload "se_saa04.wav",2	;スコア選択
+mmload "se_sud02.wav",3	;ゲーム開始
+mmload "ma_ji05.mp3",4 ;ゲームクリア！
+mmload "soft-c02.wav",5 ;ギブアップ
+mmload "se_soa03.wav",6	;メニュー項目移動
+mmload "se_sab07.wav",7	;キャンセル
+mmload "se_saa04.wav",8	;一手戻す
+mmload "cursor5.wav",9	;一手戻せない
+mmload "se_sad06.wav",10	;タイトル画面へ
+mmload "se_sad06.wav",11	;スコア画面へ
+mmload "jingle17.wav",12	;終了(未使用)
+mmload "tam-n06.mp3",13,1	;オープニングテーマ
+
+
+;全問題数、とりあえず10000問
+;表示上500の倍数限定
+Q=10000
+;save.datのヘッダ行数
+H=10
+
+;//// ログの読み込み ////
+;★Webでは保存先が永続しない可能性が高い(ページを閉じると消える)
+
+dim data0,Q+H
+exist "save.dat"
+if strsize!=-1: bload "save.dat",data0
+
+;head() ヘッダ
+;0行目:クリア問題数 ＊これに応じて表示問題数が増える。
+dim head,H
+repeat H
+	head(cnt)=data0(cnt)
+loop
+
+;data(ステータス)
+;ステータス 0:未プレイ、-1:未クリア、1以上:クリア時の手数
+dim data,Q
+repeat Q
+	data(cnt)=data0(cnt+H)
+loop
+
+Qc=0
+repeat Q
+	if data(cnt)>0:Qc=Qc+1
+loop
+
+;Qd:表示問題数
+;100問解くと500問増える
+Qd=(Qc/100+1)*500
+if Qd>Q:Qd=Q
+
+;メニュー
+;最大５項目用意しておく
+dim menu_icon,5	;メニュー項目数
+dim menu_item,5 ;メニュー項目名
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+scrx=SCRW:scry=SCRH
+screen 0,scrx,scry
+
+osel=0
+
+;//// 最初のタップ待ち ////
+;iOSのSafariは、画面をタップするまで音を鳴らせないため、ここで待つ。
+*SPLASH
+gosub *FRAME
+redraw 0
+gcls
+gput 3,0,0,280,80,0,40
+gfont 14,0
+color 255,255,255
+gtxt 78,180,"タップしてはじめる"
+gtxt scrx/2-46,scry-40,"2011 N.FUJIMAKI"
+redraw 1
+await 16
+stick skey
+if (skey&48)!=0:tpress=1
+if tpress=0:goto *SPLASH
+mmplay 13
+
+*OPENING
+gosub *FRAME
+redraw 0
+gcls
+
+gput 3,0,0,280,80,0,40
+
+menu_h=0
+menu_ofst=40
+menu_n=2	;メニュー項目数
+menu_w=0	;メニューのウィンドウ描画 0:なし 1:あり
+menu_str=5	;項目の最大文字数
+menu_icon(0)=0: menu_item(0)="ゲーム開始"
+menu_icon(1)=1: menu_item(1)="スコア"
+sel=osel
+gosub *MENU
+
+;クレジット
+gfont 12,0
+color 255,255,255
+gtxt scrx/2-46,scry-40,"2011 N.FUJIMAKI"
+gfont 10,0
+gtxt 20,scry-24,"Sound: TAM Music Factory / 音楽室 / 魔王魂"
+
+;1:左, 2:上, 4:右, 8:下, 16:SPACE, 32:ENTER, 128:ESC
+stick key
+if menu_pick>=0:osel=menu_pick: key=16
+if key=2{
+	osel=osel-1
+	if osel=-1{
+		osel=0
+	}
+	else{
+		mmplay 6
+	}
+}
+if key=8{
+	osel=osel+1
+	if osel=2{
+		osel=1
+	}
+	else{
+		mmplay 6
+	}
+}
+if key=16 or key=32{
+	switch osel
+
+		;PLAY
+		case 0
+			goto *PREPARE
+		swbreak
+
+		;RECORD
+		case 1
+			rec=0
+			gdrag=0
+			mmplay 11
+			goto *LOG
+		swbreak
+
+	swend
+}
+
+redraw 1
+await 16
+goto *OPENING
+
+
+*PREPARE
+randomize
+
+;playid: ゲームのID
+;未クリア問題優先、とりあえず4回試す。
+repeat 4
+	playid=rnd(Qd)
+	if data(playid)<=0:break
+loop
+
+*PREPARE2
+randomize playid
+
+;出現比率
+;4x4    6
+;6x6   10
+;8x8    3
+;10x10  1
+
+ssel=rnd(20)
+
+if ssel>=0 and ssel<=5: W=4: D=4: bd=bd4
+if ssel>=6 and ssel<=15: W=6: D=6: bd=bd6
+if ssel>=16 and ssel<=18: W=8: D=8: bd=bd8
+if ssel>=19 and ssel<=19: W=10: D=10: bd=bd10
+
+;typen: 型の数
+;0:タイルなし 1~type:型の
+trnd=rnd(7)
+if trnd<4: typen=4
+if trnd>=4 and trnd<6: typen=5
+if trnd=6: typen=6
+
+;stage: タイル配置パターン
+stage=rnd(4)
+
+;盤面データから、選んだパターンの行を取り出す
+sdim atms,64,D
+repeat D
+	atms(cnt)=strmid(bd,stage*D*D+cnt*D,D)
+loop
+dim park,W+2,D+2
+dim type,W+2,D+2
+
+;基本マップの読み込み
+
+;いったんすべてに-1を入れる。
+repeat D+2
+	rcnt=cnt
+	repeat W+2
+		park(cnt,rcnt)=-1
+		type(cnt,rcnt)=-1
+	loop
+loop
+
+;parkメインにランダムにtypeを入れる
+;およそ1/4程度になってほしい。
+;typen=4の場合の１つのtypeの数
+;D=4: 3+/-1    ->最低2は分配、残りはランダム
+;D=6: 6+/-2    ->最低4は分配、残りはランダム
+;D=8: 10+/-3   ->最低7は分配、残りはランダム
+;D=10: 16 +/-5 ->最低11は分配、残りはランダム
+
+;N: 総タイル数
+N=0
+repeat D,1
+	rcnt=cnt
+	repeat W,1
+		if strmid(atms(rcnt-1),cnt-1,1)="T"{
+			park(cnt,rcnt)=W*(rcnt-1)+(cnt-1)+1
+			N=N+1
+		}
+		if strmid(atms(rcnt-1),cnt-1,1)="-"{
+			park(cnt,rcnt)=0
+		}
+	loop
+loop
+
+;Nmin: 各typeの最低出現数
+Nmin=N*2/(3*typen)
+if Nmin<2: Nmin=2
+
+;tord(): 1122334400..0のような配列
+;1-4はtype,0はランダム
+dim tord,N
+repeat typen
+	i=cnt
+	repeat Nmin
+		tord(i*Nmin+cnt)=i+1
+	loop
+loop
+
+;シャッフル、とりあえず1000回
+repeat 1000
+	i=rnd(N): j=rnd(N)
+	temp=tord(i): tord(i)=tord(j): tord(j)=temp
+loop
+
+;type()に設定
+tcnt=0
+repeat D,1
+	rcnt=cnt
+	repeat W,1
+		if park(cnt,rcnt)!=0{
+			if tord(tcnt)!=0: type(cnt,rcnt)=tord(tcnt)
+			if tord(tcnt)=0: type(cnt,rcnt)=rnd(typen)+1
+			tcnt=tcnt+1
+		}
+		else{
+			type(cnt,rcnt)=0
+		}
+	loop
+loop
+
+;カラーマップを参照してグループIDを整理
+;同じ色が隣接していたら同じグループIDに統一
+;最大で（マスの個数－１）回だけ繰り返す。
+repeat W*D-1
+	repeat D,1
+		rcnt1=cnt
+		repeat W,1
+			cnt1=cnt
+				if type(cnt1,rcnt1)=type(cnt1,rcnt1-1) and park(cnt1,rcnt1)!=park(cnt1,rcnt1-1){
+					team=park(cnt1,rcnt1-1)
+					neib=park(cnt1,rcnt1)
+					repeat D,1
+						rcnt2=cnt
+						repeat W,1
+							if park(cnt,rcnt2)=neib:park(cnt,rcnt2)=team
+						loop
+					loop
+				}
+				if type(cnt1,rcnt1)=type(cnt1-1,rcnt1) and park(cnt1,rcnt1)!=park(cnt1-1,rcnt1){
+					team=park(cnt1-1,rcnt1)
+					neib=park(cnt1,rcnt1)
+					repeat D,1
+						rcnt2=cnt
+						repeat W,1
+							if park(cnt,rcnt2)=neib:park(cnt,rcnt2)=team
+						loop
+					loop
+				}
+		loop
+	loop
+loop
+
+;初期マップの保存
+dim park_init,W+2,D+2
+dim type_init,W+2,D+2
+
+;直前マップ
+dim park_prev,W+2,D+2
+dim type_prev,W+2,D+2
+
+repeat D+2
+	rcnt=cnt
+	repeat W+2
+		park_init(cnt,rcnt)=park(cnt,rcnt)
+		type_init(cnt,rcnt)=type(cnt,rcnt)
+		park_prev(cnt,rcnt)=park(cnt,rcnt)
+		type_prev(cnt,rcnt)=type(cnt,rcnt)
+	loop
+loop
+
+
+;選択タイル初期位置
+kx=1:ky=1
+
+;初回識別用の変数
+;これがないと一瞬「グリップ」とみなされる。
+first=1
+grip=0
+
+;タッチ操作の状態 0:なし、1:タイルをつかんだ、2:スライド済み(指を離すまで待つ)
+drag=0
+
+;moved: タイルを動かした回数
+;少ないほど高ランキング
+moved=0
+
+;エンディングメッセージ 0:プレイ中、1:CONGRATULATIONS!、2、GIVE UP、
+ending=0
+
+;メニューは開いていない
+menuopen=0
+
+mmstop	;オープニングテーマストップ
+mmplay 3
+
+*MAIN
+gosub *FRAME
+redraw 0
+
+gosub *DRAW
+
+;クリア判定
+prevrestn=restn
+
+dim rest,D*W
+restn=0
+repeat D,1
+	j=cnt
+	repeat W,1
+		i=cnt
+		p=park(i,j)
+		if p!=0{
+			if restn=0{
+				rest(0)=p
+				restn=restn+1
+			}
+			if restn>0{
+				add=1
+				repeat restn
+					if p=rest(cnt):add=0
+				loop
+				if add=1{
+					rest(restn)=p
+					restn=restn+1
+				}
+			}
+		}
+	loop
+loop
+
+if restn<=typen{
+	gosub *DRAW
+	redraw 1
+	mmplay 4
+	ccel=0
+	ending=1
+	drag=0
+	goto *CLEAR
+}
+
+;//// タッチ操作 ////
+if tpress{
+	;メニューボタン
+	if inrect(BTN_X-2,BTN_Y-4,BTN_W+4,BTN_H+8){
+		if moved=0{esel=0}
+		else{esel=3}
+		menuopen=1
+		drag=0: grip=0
+		goto *ESCMENU
+	}
+	;盤面をタッチ → そのタイルを選択
+	if (tmx>=x1) and (tmx<x1+W*2*tx) and (tmy>=y1) and (tmy<y1+D*2*ty){
+		kx=(tmx-x1)/(2*tx)+1
+		ky=(tmy-y1)/(2*ty)+1
+		drag=1
+		dsx=tmx: dsy=tmy
+	}
+}
+
+;選ばれたteamがleader
+leader=park(kx,ky)
+
+if drag>0{
+	if tdn=0{
+		drag=0: grip=0
+	}
+	else{
+		if leader!=0: grip=1
+		if drag=1{
+			;つかんだ位置から一定距離動いたら、その方向へスライド
+			ddx=tmx-dsx: ddy=tmy-dsy
+			if (abs(ddx)>=10) or (abs(ddy)>=10){
+				if leader!=0{
+					if abs(ddx)>=abs(ddy){
+						dy=0
+						if ddx>0{
+							dx=1
+						}
+						else{
+							dx=-1
+						}
+					}
+					else{
+						dx=0
+						if ddy>0{
+							dy=1
+						}
+						else{
+							dy=-1
+						}
+					}
+					drag=2
+					goto *CHECK
+				}
+			}
+		}
+	}
+}
+
+;動かすタイルの選択(キーボード用)
+;1:左, 2:上, 4:右, 8:下, 16:スペース
+;スペースキーを「押しながら」方向キーを押すことでタイルを動かす。
+if drag=0{
+	stick key,16
+	if key&16{
+		if first=0 & leader!=0{
+			grip=1
+
+			;←左
+			if key&1{
+				dx=-1:dy=0
+				goto *CHECK
+			}
+
+			;↑上
+			if key&2{
+				dx=0:dy=-1
+				goto *CHECK
+			}
+
+			;→右
+			if key&4{
+				dx=1:dy=0
+				goto *CHECK
+			}
+
+			;↓下
+			if key&8{
+				dx=0:dy=1
+				goto *CHECK
+			}
+		}
+	}
+	else{
+		first=0
+		grip=0
+		;←左
+		if key=1{
+			kx=kx-1
+			if kx=0{kx=1}
+		}
+
+		;↑上
+		if key=2{
+			ky=ky-1
+			if ky=0{ky=1}
+		}
+
+		;→右
+		if key=4{
+			kx=kx+1
+			if kx=W+1{kx=W}
+		}
+
+		;↓下
+		if key=8{
+			ky=ky+1
+			if ky=D+1{ky=D}
+		}
+
+		;ESC
+		;初回はメニューが異なる
+		if key=128{
+			if moved=0{esel=0}
+			else{esel=3}
+			menuopen=1
+			goto *ESCMENU
+		}
+	}
+}
+
+;メニューは開いていない
+menuopen=0
+
+redraw 1
+await 16
+goto *MAIN
+
+
+;//// 毎フレームの前処理(画面サイズ・タッチ入力) ////
+*FRAME
+sc=double(ginfo_winx)/SCRW
+if double(ginfo_winy)/SCRH<sc:sc=double(ginfo_winy)/SCRH
+ox=(ginfo_winx-int(SCRW*sc))/2
+oy=(ginfo_winy-int(SCRH*sc))/2
+
+;★HSP3Dishではタッチがマウス左ボタンとして扱われる想定
+getkey tdn,1
+tpress=0: trel=0
+if tdn=1 and tprev=0:tpress=1
+if tdn=0 and tprev=1:trel=1
+tprev=tdn
+tmx=int((mousex-ox)/sc)
+tmy=int((mousey-oy)/sc)
+return
+
+
+*DRAW
+;描画
+tx=12: ty=12
+a0x=0
+a0y=scry/2-D*ty-scrx/2+W*tx-20 ;全体のオフセット
+
+;壁
+x1=a0x+(scrx-2*tx*W)/2
+y1=a0y+(scry-2*ty*D)/2
+
+gcls
+
+color 192,192,192
+gbox x1,y1,x1+W*2*tx-1,y1+D*2*ty-1
+
+color 96,96,96
+gline x1-2,y1-1,x1+W*2*tx,y1-1
+gline x1-1,y1-2,x1-1,y1+D*2*ty
+
+color 244,244,244
+gline x1+W*2*tx,y1-1,x1+W*2*tx,y1+D*2*ty
+gline x1-1,y1+D*2*ty,x1+W*2*tx,y1+D*2*ty
+
+
+;タイル
+repeat D,1
+	rcnt=cnt
+	repeat W,1
+		t=type(cnt,rcnt)
+		tL=type(cnt-1,rcnt)
+		tR=type(cnt+1,rcnt)
+		tU=type(cnt,rcnt-1)
+		tD=type(cnt,rcnt+1)
+		tLU=type(cnt-1,rcnt-1)
+		tRU=type(cnt+1,rcnt-1)
+		tLD=type(cnt-1,rcnt+1)
+		tRD=type(cnt+1,rcnt+1)
+		gy=(t-1)*4*ty
+		posx=x1+(cnt-1)*2*tx
+		posy=y1+(rcnt-1)*2*ty
+
+		if t!=0{
+			;左上
+			if tL!=t and tU!=t: gput 1,tx*0,gy+0,tx,ty,posx,posy
+			if tL=t and tU!=t: gput 1,tx*1,gy+0,tx,ty,posx,posy
+			if tL!=t and tU=t: gput 1,tx*2,gy+0,tx,ty,posx,posy
+			if tL=t and tU=t and tLU!=t: gput 1,tx*3,gy+0,tx,ty,posx,posy
+			if tL=t and tU=t and tLU=t: gput 1,tx*4,gy+0,tx,ty,posx,posy
+
+			;右上
+			if tR!=t and tU!=t: gput 1,tx*0,gy+ty*1,tx,ty,posx+tx,posy
+			if tR=t and tU!=t: gput 1,tx*1,gy+ty*1,tx,ty,posx+tx,posy
+			if tR!=t and tU=t: gput 1,tx*2,gy+ty*1,tx,ty,posx+tx,posy
+			if tR=t and tU=t and tRU!=t: gput 1,tx*3,gy+ty*1,tx,ty,posx+tx,posy
+			if tR=t and tU=t and tRU=t: gput 1,tx*4,gy+ty*1,tx,ty,posx+tx,posy
+
+			;左下
+			if tL!=t and tD!=t: gput 1,tx*0,gy+ty*2,tx,ty,posx,posy+ty
+			if tL=t and tD!=t: gput 1,tx*1,gy+ty*2,tx,ty,posx,posy+ty
+			if tL!=t and tD=t: gput 1,tx*2,gy+ty*2,tx,ty,posx,posy+ty
+			if tL=t and tD=t and tLD!=t: gput 1,tx*3,gy+ty*2,tx,ty,posx,posy+ty
+			if tL=t and tD=t and tLD=t: gput 1,tx*4,gy+ty*2,tx,ty,posx,posy+ty
+
+			;右下
+			if tR!=t and tD!=t: gput 1,tx*0,gy+ty*3,tx,ty,posx+tx,posy+ty
+			if tR=t and tD!=t: gput 1,tx*1,gy+ty*3,tx,ty,posx+tx,posy+ty
+			if tR!=t and tD=t: gput 1,tx*2,gy+ty*3,tx,ty,posx+tx,posy+ty
+			if tR=t and tD=t and tRD!=t: gput 1,tx*3,gy+ty*3,tx,ty,posx+tx,posy+ty
+			if tR=t and tD=t and tRD=t: gput 1,tx*4,gy+ty*3,tx,ty,posx+tx,posy+ty
+
+		}
+	loop
+loop
+
+;手
+if ending=0{
+	handx=24
+	handy=24
+	if grip=1: gput 2,handx,0,handx,handy,x1+(kx-1)*2*tx,y1+(ky-1)*2*ty
+	if grip=0: gput 2,0,0,handx,handy,x1+(kx-1)*2*tx,y1+(ky-1)*2*ty
+}
+
+;情報
+pstr=""
+p1=playid\10
+p10=(playid/10)\10
+p100=(playid/100)\10
+p1000=(playid/1000)\10
+pstr=pstr+p1000+p100+p10+p1
+
+gfont 14,0
+color 255,255,255
+gtxt 5,5,"["+pstr+"]"
+
+;現在の手数
+if moved>0{
+	gfont 14,0
+	color 255,255,255
+	gtxt scrx-80,5,"現在"+moved+"手"
+}
+
+;メニューボタン・ガイド
+if menuopen=0{
+	if ending>0{
+		gfont 12,0
+		color 255,255,255
+		gtxt 70,scry-20,"画面タップでメニュー"
+	}
+	else{
+		color 255,255,255
+		gbox BTN_X,BTN_Y,BTN_X+BTN_W-1,BTN_Y+BTN_H-1
+		color 32,32,32
+		gbox BTN_X+1,BTN_Y+1,BTN_X+BTN_W-2,BTN_Y+BTN_H-2
+		gput 2,216,72,24,24,BTN_X+6,BTN_Y+5
+		gfont 14,0
+		color 255,255,255
+		gtxt BTN_X+36,BTN_Y+10,"メニュー"
+	}
+}
+
+;クリア済みの場合
+if data(playid)>0{
+	gfont 14,0
+	color 255,255,255
+	gtxt 50,5,"クリア済み "+data(playid)+"手"
+}
+
+;以前あきらめたことあがある場合
+if data(playid)<0{
+	gfont 14,0
+	color 255,255,255
+	gtxt 50,5,"未クリア"
+}
+
+;クリア後メッセージ
+switch ending
+case 1
+	gfont 24,MY_BOLD
+	color 128,128,128
+	gtxt 37,141,"CONGRATULATIONS!"
+	color 255,255,255
+	gtxt 36,140,"CONGRATULATIONS!"
+
+	if playid>0 and moved<data(playid){
+		gfont 16,MY_BOLD
+		color 128,128,128
+		gtxt 90,196,"最少手更新！"
+		color 255,255,255
+		gtxt 91,195,"最少手更新！"
+	}
+
+	if data(playid)<=0 and Qc\100=99 and Qc<=Q/500*100{
+		gfont 16,MY_BOLD
+		color 128,128,128
+		gtxt 53,221,"問題が追加されました！"
+		color 255,255,255
+		gtxt 52,220,"問題が追加されました！"
+	}
+swbreak
+
+case 2
+	gfont 20,MY_BOLD
+	color 128,128,128
+	gtxt 101,141,"GIVE UP"
+	color 255,255,255
+	gtxt 100,140,"GIVE UP"
+swbreak
+
+swend
+
+return
+
+
+*CHECK
+;mov(): 力の及ぶteamを格納、大きさは最大マス数+1
+;movn: 力の及ぶteamの個数
+;page: mov()内の位置、このteamの隣接を確認する
+
+dim mov,D*W+1
+mov(0)=leader
+movn=1
+page=0
+
+freeze=0
+
+*CHECK2
+if mov(page)=0{
+	if freeze=1{
+		mmplay 1
+		freeze=0: goto *MAIN
+	}
+	else{
+		goto *SLIDE
+	}
+}
+repeat D,1
+	j1=cnt
+	repeat W,1
+		i1=cnt
+		if park(i1,j1)=mov(page){
+			temp1=park(i1+dx,j1+dy)
+
+			;隣接をたどって壁に当たったら即終了
+			if temp1=-1:freeze=1: break: goto *MAIN
+
+			f1=0
+			repeat movn
+				if mov(cnt)=temp1:f1=1
+			loop
+			if f1=0 and temp1!=0: movn=movn+1: mov(movn-1)=temp1
+		}
+	loop
+loop
+page=page+1
+goto *CHECK2
+
+
+*SLIDE
+;動かす前の状態を保存
+repeat D+2
+	rcnt=cnt
+	repeat W+2
+		park_prev(cnt,rcnt)=park(cnt,rcnt)
+		type_prev(cnt,rcnt)=type(cnt,rcnt)
+	loop
+loop
+
+kx_prev=kx:ky_prev=ky
+
+;いったんコマをなくす。
+dim dpark,W+2,D+2
+dim dtype,W+2,D+2
+repeat movn
+	page=cnt
+	repeat D,1
+		j1=cnt
+		repeat W,1
+			i1=cnt
+			if park(i1,j1)=mov(page){
+				dpark(i1+dx,j1+dy)=park(i1,j1)
+				park(i1,j1)=0
+				dtype(i1+dx,j1+dy)=type(i1,j1)
+				type(i1,j1)=0
+			}
+		loop
+	loop
+loop
+
+repeat D,1
+	j1=cnt
+	repeat W,1
+		i1=cnt
+		park(i1,j1)=park(i1,j1)+dpark(i1,j1)
+		type(i1,j1)=type(i1,j1)+dtype(i1,j1)
+	loop
+loop
+
+;選択カーソルも一緒に移動
+kx=kx+dx:ky=ky+dy
+
+;くっつき処理
+;mov()を利用する。
+repeat movn
+	dim join,D*W
+	jn=0
+
+	page=cnt
+	;隣接チェック
+	repeat D,1
+		j1=cnt
+		repeat W,1
+			i1=cnt
+
+			p=park(i1,j1)
+			pL=park(i1-1,j1)
+			pU=park(i1,j1+1)
+			pR=park(i1+1,j1)
+			pD=park(i1,j1-1)
+
+			t=type(i1,j1)
+			tL=type(i1-1,j1)
+			tU=type(i1,j1+1)
+			tR=type(i1+1,j1)
+			tD=type(i1,j1-1)
+
+			if p=mov(page){
+				;左隣り
+				if pL!=p and tL=t: join(jn)=pL: jn=jn+1
+				;上隣り
+				if pU!=p and tU=t: join(jn)=pU: jn=jn+1
+				;右隣り
+				if pR!=p and tR=t: join(jn)=pR: jn=jn+1
+				;下隣り
+				if pD!=p and tD=t: join(jn)=pD: jn=jn+1
+				}
+		loop
+	loop
+
+	;変更実行
+	if jn>0{
+		repeat jn
+			page2=cnt
+			repeat D,1
+				j2=cnt
+				repeat W,1
+					i2=cnt
+					if park(i2,j2)=join(page2): park(i2,j2)=mov(page)
+				loop
+			loop
+		loop
+	}
+loop
+
+;動かした回数を増やす
+moved=moved+1
+mmplay 0
+
+goto *MAIN
+
+
+;プレイ中メニュー
+*ESCMENU
+gosub *FRAME
+redraw 0
+
+gosub *DRAW
+
+if moved=0{
+
+	menu_h=0
+	menu_ofst=0
+	menu_n=3	;メニュー項目数
+	menu_w=1	;メニュー背景 0:なし 1:あり
+	menu_str=7	;項目の最大文字数
+	menu_icon(0)=7: menu_item(0)="別の問題に挑戦"
+	menu_icon(1)=6: menu_item(1)="タイトル画面へ"
+	menu_icon(2)=8: menu_item(2)="キャンセル"
+	sel=esel
+	menuopen=1
+	gosub *MENU
+
+	stick key
+	if menu_pick>=0:esel=menu_pick: key=16
+	if menu_out=1:key=128
+	if key=2{
+		esel=esel-1
+		if esel=-1{esel=0}
+		else{mmplay 6}
+	}
+	if key=8{
+		esel=esel+1
+		if esel=3{esel=2}
+		else{mmplay 6}
+	}
+
+	if key=16 or key=32{
+		switch esel
+			;チェンジ
+			case 0
+				goto *PREPARE
+			swbreak
+
+			;トップ
+			case 1
+				osel=0
+				mmplay 10
+				mmplay 13
+				goto *OPENING
+			swbreak
+
+			;キャンセル
+			case 2
+			 	first=1
+			 	mmplay 7
+				goto *MAIN
+			swbreak
+		swend
+	}
+
+	if key=128{
+	 	first=1
+	 	mmplay 7
+		goto *MAIN
+	}
+}
+else{
+
+	menu_h=0
+	menu_ofst=0
+	menu_n=4	;メニュー項目数
+	menu_w=1	;メニュー背景 0:なし 1:あり
+	menu_str=9	;項目の最大文字数
+	menu_icon(0)=3: menu_item(0)="あきらめる"
+	menu_icon(1)=4: menu_item(1)="一手戻す"
+	menu_icon(2)=5: menu_item(2)="最初からやりなおし"
+	menu_icon(3)=8: menu_item(3)="キャンセル"
+	sel=esel
+	menuopen=1
+	gosub *MENU
+
+	stick key
+	if menu_pick>=0:esel=menu_pick: key=16
+	if menu_out=1:key=128
+	if key=2{
+		esel=esel-1
+		if esel=-1{esel=0}
+		else{mmplay 6}
+	}
+	if key=8{
+		esel=esel+1
+		if esel=4{esel=3}
+		else{mmplay 6}
+	}
+	if key=16 or key=32{
+		switch esel
+			;あきらめる
+			case 0
+				bsel=0
+				ending=2
+				gosub *DRAW
+				redraw 1
+				mmplay 5
+				goto *GIVEUP
+			swbreak
+
+			;一手戻す
+			case 1
+				;変化ない場合は戻さない。
+				dif=0
+				repeat D+2
+					rcnt=cnt
+					repeat W+2
+						if park(cnt,rcnt)!=park_prev(cnt,rcnt):dif=1:break
+					loop
+					if dif=1:break
+				loop
+
+				if dif=0{
+					first=1
+					mmplay 9
+					goto *MAIN
+					swbreak
+				}
+
+				repeat D+2
+					rcnt=cnt
+					repeat W+2
+						park(cnt,rcnt)=park_prev(cnt,rcnt)
+						type(cnt,rcnt)=type_prev(cnt,rcnt)
+					loop
+				loop
+				kx=kx_prev:ky=ky_prev
+				first=1
+				moved=moved-1
+				mmplay 8
+				goto *MAIN
+			swbreak
+
+			;最初から
+			case 2
+				repeat D+2
+					rcnt=cnt
+					repeat W+2
+						park(cnt,rcnt)=park_init(cnt,rcnt)
+						type(cnt,rcnt)=type_init(cnt,rcnt)
+						park_prev(cnt,rcnt)=park_init(cnt,rcnt)
+						type_prev(cnt,rcnt)=type_init(cnt,rcnt)
+					loop
+				loop
+				kx=1:ky=1
+				first=1
+				moved=0
+				mmplay 3
+				goto *MAIN
+			swbreak
+
+			;キャンセル
+			case 3
+			 	first=1
+			 	mmplay 7
+				goto *MAIN
+			swbreak
+		swend
+	}
+
+	if key=128{
+	 	first=1
+	 	mmplay 7
+		goto *MAIN
+	}
+}
+
+redraw 1
+await 16
+goto *ESCMENU
+
+
+*CLEAR
+gosub *FRAME
+stick key
+if tpress:key=16
+if key=16 or key=32 or key=128{
+	goto *CLEAR2
+}
+
+redraw 0
+
+gosub *DRAW
+
+menuopen=0
+
+redraw 1
+await 16
+goto *CLEAR
+
+
+*CLEAR2
+gosub *FRAME
+redraw 0
+
+gosub *DRAW
+
+menu_ofst=0
+menu_n=4	;メニュー項目数
+menu_w=1	;メニュー背景 0:なし 1:あり
+menu_str=7	;項目の最大文字数
+menu_icon(0)=0: menu_item(0)="次の問題に挑戦"
+menu_icon(1)=0: menu_item(1)="もう一回挑戦"
+menu_icon(2)=6: menu_item(2)="タイトル画面へ"
+menu_icon(3)=8: menu_item(3)="キャンセル"
+sel=csel
+menuopen=1
+gosub *MENU
+
+stick key
+if menu_pick>=0:csel=menu_pick: key=16
+if menu_out=1:csel=3: key=16
+if key=2{
+	csel=csel-1
+	if csel=-1{csel=0}
+	else{mmplay 6}
+}
+if key=8{
+	csel=csel+1
+	if csel=4{csel=3}
+	else{mmplay 6}
+}
+
+if key=16 or key=32{
+	switch csel
+		;別の問題に挑戦
+		case 0
+			gosub *DATASAVE
+			goto *PREPARE
+		swbreak
+
+		;もう一回挑戦
+		case 1
+			gosub *DATASAVE
+			goto *PREPARE2
+		swbreak
+
+		;トップ
+		case 2
+			gosub *DATASAVE
+			osel=0
+			mmplay 10
+			mmplay 13
+			goto *OPENING
+		swbreak
+
+		;眺める
+		case 3
+			csel=0
+			mmplay 7
+			goto *CLEAR
+		swbreak
+
+	swend
+}
+
+if key=128{
+	csel=0
+	goto *CLEAR
+}
+
+redraw 1
+await 16
+goto *CLEAR2
+
+
+*DATASAVE
+if data(playid)<=0: data(playid)=moved: Qc=Qc+1
+if data(playid)>moved: data(playid)=moved
+head(0)=Qc
+
+dim data1,Qd+H
+repeat H
+	data1(cnt)=head(cnt)
+loop
+repeat Qd
+	data1(cnt+H)=data(cnt)
+loop
+
+
+bsave "save.dat",data1
+
+return
+
+
+*GIVEUP
+gosub *FRAME
+stick key
+if tpress:key=16
+if key=16 or key=32 or key=128{
+	goto *GIVEUP2
+}
+
+redraw 0
+
+gosub *DRAW
+
+menuopen=0
+
+redraw 1
+await 16
+goto *GIVEUP
+
+
+*GIVEUP2
+gosub *FRAME
+;データセーブ
+;-1:未クリア
+
+redraw 0
+gosub *DRAW
+
+menu_ofst=0
+menu_n=3	;メニュー項目数
+menu_w=1	;メニュー背景 0:なし 1:あり
+menu_str=7	;項目の最大文字数
+menu_icon(0)=0: menu_item(0)="次の問題に挑戦"
+menu_icon(1)=6: menu_item(1)="タイトル画面へ"
+menu_icon(2)=8: menu_item(2)="キャンセル"
+sel=bsel
+menuopen=1
+gosub *MENU
+
+stick key
+if menu_pick>=0:bsel=menu_pick: key=16
+if menu_out=1:bsel=2: key=16
+if key=2{
+	bsel=bsel-1
+	if bsel=-1{bsel=0}
+	else{mmplay 6}
+}
+if key=8{
+	bsel=bsel+1
+	if bsel=3{bsel=2}
+	else{mmplay 6}
+}
+if key=16 or key=32{
+	switch bsel
+
+		;もう一回
+		case 0
+			gosub *DATASAVE2
+			goto *PREPARE
+		swbreak
+
+		;トップ
+		case 1
+			gosub *DATASAVE2
+			osel=0
+			mmplay 10
+			mmplay 13
+			goto *OPENING
+		swbreak
+
+		;画面見る
+		case 2
+			mmplay 7
+			goto *GIVEUP
+		swbreak
+
+	swend
+}
+
+redraw 1
+await 16
+goto *GIVEUP2
+
+
+*DATASAVE2
+if data(playid)=0:data(playid)=-1
+
+dim data1,Qd+H
+repeat H
+	data1(cnt)=head(cnt)
+loop
+repeat Qd
+	data1(cnt+H)=data(cnt)
+loop
+
+bsave "save.dat",data1
+return
+
+
+*LOG
+;ゲームはplayidで管理される。
+;未プレイ→グレー、クリアした→黄色、ギブアップした→青
+
+gosub *FRAME
+redraw 0
+gcls
+
+;Qd:表示問題数
+;100問解くと500問増える
+Qd=(Qc/100+1)*500
+if Qd>Q:Qd=Q
+
+bsz=8
+bgp=2
+bx=25
+by=20
+x0=(scrx-(bsz+bgp)*bx)/2+2
+y0=80
+
+lz=rec/(bx*by)
+rec1=rec-lz*(bx*by)
+lx=rec1\bx
+ly=rec1/bx
+
+repeat by
+	rcnt=cnt
+	repeat bx
+		d1=data(lz*(bx*by)+rcnt*bx+cnt)
+		if d1=0: color 80,80,80
+		if d1=-1: color 0,0,255
+		if d1>0: color 255,255,0
+		gbox x0+(bsz+bgp)*cnt,y0+(bsz+bgp)*rcnt,x0+(bsz+bgp)*cnt+(bsz-1),y0+(bsz+bgp)*rcnt+(bsz-1)
+	loop
+loop
+
+gput 2,48,0,13,13,x0+(bsz+bgp)*lx-2,y0+(bsz+bgp)*ly-2
+
+;情報
+rstr=""
+r1=rec\10
+r10=(rec/10)\10
+r100=(rec/100)\10
+r1000=(rec/1000)\10
+rstr=rstr+r1000+r100+r10+r1
+
+gfont 14,0
+color 255,255,255
+gtxt 5,5,"["+rstr+"]"
+
+gfont 12,0
+color 255,255,255
+gtxt scrx-105,5,"全"+Qd+"問"
+
+gtxt scrx-105,20,"クリア済み"+Qc+"問"
+
+gfont 14,0
+color 255,255,255
+if data(rec)=-1: gtxt 50,5,"未クリア"
+if data(rec)>0: gtxt 50,5,"クリア済み "+data(rec)+"手"
+
+randomize rec
+info1=rnd(20)
+if info1>=0 and info1<=5: gtxt 10,25,"SMALL"
+if info1>=6 and info1<=15: gtxt 10,25,"MEDIUM"
+if info1>=16 and info1<=18: gtxt 10,25,"LARGE"
+if info1>=19 and info1<=19: gtxt 10,25,"JUMBO"
+
+info2=rnd(7)
+if info2>=0 and info2<=3: gput 2,0,24,12*4,12,8,40
+if info2>=4 and info2<=5: gput 2,0,24,12*5,12,8,40
+if info2>=6 and info2<=6: gput 2,0,24,12*6,12,8,40
+
+;ボタン
+gbutton 8,288,164,24,"この問題に挑戦"
+gbutton 8,316,164,22,"タイトル画面へ"
+if Qd>500{
+	gbutton 180,288,44,24,"前へ"
+	gbutton 228,288,44,24,"次へ"
+}
+
+;//// タッチ操作 ////
+if tpress{
+	gdrag=0
+	;一覧の上をタッチした場合、指を動かして問題番号を選べる。
+	if (tmx>=x0) and (tmx<x0+(bsz+bgp)*bx) and (tmy>=y0) and (tmy<y0+(bsz+bgp)*by):gdrag=1
+
+	if inrect(8,288,164,24){
+		playid=rec
+		mmstop
+		goto *PREPARE2
+	}
+	if inrect(8,316,164,22){
+		osel=0
+		mmplay 7
+		goto *OPENING
+	}
+	if Qd>500{
+		if inrect(180,288,44,24){
+			rec=rec-bx*by: if rec<0:rec=rec+Qd
+			mmplay 2
+		}
+		if inrect(228,288,44,24){
+			rec=rec+bx*by: if rec>=Qd:rec=rec-Qd
+			mmplay 2
+		}
+	}
+}
+if tdn=0:gdrag=0
+if gdrag=1{
+	if (tmx>=x0) and (tmx<x0+(bsz+bgp)*bx) and (tmy>=y0) and (tmy<y0+(bsz+bgp)*by){
+		cc=(tmx-x0)/(bsz+bgp)
+		rr=(tmy-y0)/(bsz+bgp)
+		rn=lz*(bx*by)+rr*bx+cc
+		if rn>Qd-1:rn=Qd-1
+		if rn!=rec{
+			rec=rn
+			mmplay 2
+		}
+	}
+}
+
+;キーボード操作(PC用)
+stick key,15
+if key&15: mmplay 2
+if key=1{
+	rec=rec-1:if rec=-1:rec=Qd-1
+}
+if key=2{
+	rec=rec-bx:if rec<0:rec=rec+Qd
+}
+if key=4{
+	rec=rec+1:if rec=Qd:rec=0
+}
+if key=8{
+	rec=rec+bx:if rec>Qd-1:rec=rec-Qd
+}
+
+if key=16 or key=32{
+	playid=rec
+	mmstop
+	goto *PREPARE2
+}
+
+if key=128{
+	osel=0
+	mmplay 7
+	goto *OPENING
+}
+
+getkey pageup,33
+if pageup=1: rec=rec-bx*by: if rec<0:rec=rec+Qd
+
+getkey pagedn,34
+if pagedn=1: rec=rec+bx*by: if rec>=Qd:rec=rec-Qd
+
+redraw 1
+await 33
+goto *LOG
+
+
+;汎用メニュー描画 + タップ判定
+*MENU
+
+;フォント
+gfont 14,0
+
+;配色、グレースケール
+menu_bcol=32	;メニューの背景色
+menu_frcol=255	;メニューのフレームの色
+menu_scol=96	;選択中項目の色
+menu_ftcol=96	;メニューのフォントの色
+menu_sftcol=255	;選択中のフォントの色
+
+;ウィンドウ内オブジェクト描画範囲のサイズ
+menu_bx=30+menu_str*14+6
+menu_by=24*menu_n+6*(menu_n-1)
+
+;ウィンドウ内オブジェクト描画範囲の上左の位置
+menu_posx=scrx/2-menu_bx/2
+menu_posy=scry/2-menu_by/2+menu_ofst
+
+;ウィンドウのサイズ
+menu_frm=2		;枠の幅
+menu_wmgn=6		;オブジェクト描画範囲からの余白
+menu_wx=menu_bx+menu_wmgn*2
+menu_wy=menu_by+menu_wmgn*2
+
+;ウィンドウの上左の位置
+menu_wposx=scrx/2-menu_wx/2
+menu_wposy=scry/2-menu_wy/2+menu_ofst
+
+;ウィンドウ描画
+if menu_w=1{
+	color menu_frcol,menu_frcol,menu_frcol
+	gbox menu_wposx-menu_frm,menu_wposy-menu_frm,menu_wposx+menu_wx+menu_frm,menu_wposy+menu_wy+menu_frm
+	color menu_bcol,menu_bcol,menu_bcol
+	gbox menu_wposx,menu_wposy,menu_wposx+menu_wx,menu_wposy+menu_wy
+}
+
+;選択領域のサイズ
+menu_sx=menu_bx
+menu_sy=24
+
+;選択領域描画
+color menu_scol,menu_scol,menu_scol
+gbox menu_posx,menu_posy+30*sel,menu_posx+menu_sx,menu_posy+30*sel+menu_sy
+
+repeat menu_n
+	if sel=cnt{
+		gput 2,menu_icon(cnt)*24,72,24,24,menu_posx,menu_posy+30*cnt
+		color menu_sftcol,menu_sftcol,menu_sftcol
+	}
+	else{
+		gput 2,menu_icon(cnt)*24,48,24,24,menu_posx,menu_posy+30*cnt
+		color menu_ftcol,menu_ftcol,menu_ftcol
+	}
+	gtxt menu_posx+30,menu_posy+30*cnt+5,menu_item(cnt)
+loop
+
+;タップ判定 menu_pick:タップした項目(なければ-1)、menu_out:メニュー枠の外をタップ(1)
+menu_pick=-1
+menu_out=0
+if tpress{
+	repeat menu_n
+		if inrect(menu_posx,menu_posy+30*cnt-3,menu_sx,30):menu_pick=cnt
+	loop
+	if menu_pick<0 and menu_w=1{
+		if inrect(menu_wposx,menu_wposy,menu_wx,menu_wy)=0:menu_out=1
+	}
+}
+
+return
